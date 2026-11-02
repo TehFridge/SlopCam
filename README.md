@@ -1,5 +1,6 @@
 SlopCam
 =======
+# DISCLAIMER: (I MADE THIS VIBECODED SLOP FOR FUN, WANTED TO SEE IF AI CAN MAX OUT THE 3DS RECORDING BETTER, PLZ DONT KILL ME)
 
 3DS camera app: live viewfinder, photos, and AVI recording with sound.
 
