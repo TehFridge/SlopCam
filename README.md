@@ -106,4 +106,6 @@ Build: needs devkitARM + libctru + libjpeg-turbo portlib (`make`).
 ## Credits:
 Logo and Icon: TehFridge
 <br>
+Banner Jingle: excerpt from Acid Pop by pink (from the Abyss)
+<br>
 Everything else: Claude
