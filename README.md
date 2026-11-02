@@ -102,3 +102,7 @@ Language (CAMERA): English / Polski. The 3DS console font has no Polish letters,
 shown without diacritics.
 
 Build: needs devkitARM + libctru + libjpeg-turbo portlib (`make`).
+
+## Credits:
+Logo and Icon: TehFridge
+Everything else: Claude
