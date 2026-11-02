@@ -104,7 +104,7 @@ static int s_wb = 0, s_sharp = 0, s_contrast = 6, s_noise = 1;
 static int s_scene = 0, s_autoexp = 1, s_lens = 1, s_flip = 0;
 static int s_sat = 100, s_bright = 0;  // software colour: saturation %, brightness offset
 static int s_eq_on = 0, s_eq[MICEQ_BANDS] = { 0, 0, 0, 0, 0 }, s_eq_lowcut = 0, s_eq_boost = 0, s_eq_limit = 1;
-static int s_rec_q = 95, s_rec_chroma = 1, s_rec_dct = 1, s_rec_fps = 0, s_audio = 4, s_mic_gain = 40;
+static int s_rec_q = 70, s_rec_chroma = 1, s_rec_dct = 1, s_rec_fps = 0, s_audio = 4, s_mic_gain = 60;
 static int s_encoder = 0;              // 0 = fastjpeg (ARM11 SIMD), 1 = libjpeg-turbo
 static int s_skip = 2;                 // static-block skip (fast encoder, video)
 static int s_mode = 0;                 // 0 = video, 1 = photo
