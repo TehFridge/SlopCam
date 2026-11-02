@@ -105,4 +105,5 @@ Build: needs devkitARM + libctru + libjpeg-turbo portlib (`make`).
 
 ## Credits:
 Logo and Icon: TehFridge
+<br>
 Everything else: Claude
