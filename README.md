@@ -1,12 +1,11 @@
 SlopCam
 =======
-# DISCLAIMER: (I MADE THIS VIBECODED SLOP FOR FUN, WANTED TO SEE IF AI CAN MAX OUT THE 3DS RECORDING BETTER, PLZ DONT KILL ME)
 
 3DS camera app: live viewfinder, photos, and AVI recording with sound.
 
 Controls
 - A: switch between VIDEO and PHOTO mode.
-- Y: VIDEO = start/stop recording to `sdmc:/3ds_cam/VID_<date>_<time>.avi` (MJPEG + mono PCM, splits
+- Y: VIDEO = start/stop recording (X = pause/resume) to `sdmc:/3ds_cam/VID_<date>_<time>.avi` (MJPEG + mono PCM, splits
   into `_part2.avi`... every ~1.9 GB, so no file ever gets near FAT32's 4 GB limit). While
   recording, a line under [REC] shows: File N [bar] % = how full the current file is before the
   next part starts (turns yellow at 90%), then SD free space and recording time left at the
@@ -88,6 +87,21 @@ Biggest speed knobs, in order: Encoder, Resolution, Chroma 4:2:0, File FPS. JPEG
 at high values (more non-zero coefficients to code).
 The [REC] line shows real frames, late (dropped) frames and MB per minute, so you can see the effect of each tweak.
 
+Pause (video mode, while recording)
+- X pauses, X again resumes; Y still stops (also while paused). The file simply continues:
+  no gap, no silence, audio and video stay in sync across any number of pauses.
+- While paused you can change Camera (outer / inner / 3D), Outer side and Cam FPS, and the
+  preview is always on so you can frame the next shot. Resolution, File FPS and audio stay
+  locked, because they're fixed for the whole AVI file.
+- After switching camera, resume waits until the new camera is delivering pictures
+  ("camera starting..."), so the video never freezes on resume.
+- How it stays reliable: pause and resume are a handshake with the SD writer, and a new press
+  is ignored until the writer has confirmed the previous one ([PAUSING...] shows for a moment).
+  Every frame captured before the press is still written, nothing captured during the pause
+  is, and audio and video are both cut at the same video-frame boundary (at most one frame,
+  33 ms, after the press) so they can't drift apart over many pauses. While paused the mic
+  keeps being read and discarded, so even very long pauses can't overflow its buffer.
+
 Start-up camera check
 - At start-up SlopCam grabs one small frame from the left and the right outer camera. If one of
   them doesn't deliver, the app starts with the one that works: "Outer side" marks the broken
@@ -102,10 +116,3 @@ Language (CAMERA): English / Polski. The 3DS console font has no Polish letters,
 shown without diacritics.
 
 Build: needs devkitARM + libctru + libjpeg-turbo portlib (`make`).
-
-## Credits:
-Logo and Icon: TehFridge
-<br>
-Banner Jingle: excerpt from Acid Pop by pink (from the Abyss)
-<br>
-Everything else: Claude
