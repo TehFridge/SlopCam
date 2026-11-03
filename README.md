@@ -1,5 +1,6 @@
 SlopCam
 =======
+# DISCLAIMER: (I MADE THIS VIBECODED SLOP FOR FUN, WANTED TO SEE IF AI CAN MAX OUT THE 3DS RECORDING BETTER, PLZ DONT KILL ME)
 
 3DS camera app: live viewfinder, photos, and AVI recording with sound.
 
@@ -116,3 +117,10 @@ Language (CAMERA): English / Polski. The 3DS console font has no Polish letters,
 shown without diacritics.
 
 Build: needs devkitARM + libctru + libjpeg-turbo portlib (`make`).
+
+## Credits:
+Logo and Icon: TehFridge
+<br>
+Banner Jingle: excerpt from Acid Pop by pink (from the Abyss)
+<br>
+Everything else: Claude
