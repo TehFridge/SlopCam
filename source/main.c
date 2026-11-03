@@ -104,7 +104,7 @@ static int s_wb = 0, s_sharp = 0, s_contrast = 6, s_noise = 1;
 static int s_scene = 0, s_autoexp = 1, s_lens = 1, s_flip = 0;
 static int s_sat = 100, s_bright = 0;  // software colour: saturation %, brightness offset
 static int s_eq_on = 0, s_eq[MICEQ_BANDS] = { 0, 0, 0, 0, 0 }, s_eq_lowcut = 0, s_eq_boost = 0, s_eq_limit = 1;
-static int s_rec_q = 70, s_rec_chroma = 1, s_rec_dct = 1, s_rec_fps = 0, s_audio = 4, s_mic_gain = 60;
+static int s_rec_q = 95, s_rec_chroma = 1, s_rec_dct = 1, s_rec_fps = 0, s_audio = 4, s_mic_gain = 40;
 static int s_encoder = 0;              // 0 = fastjpeg (ARM11 SIMD), 1 = libjpeg-turbo
 static int s_skip = 2;                 // static-block skip (fast encoder, video)
 static int s_mode = 0;                 // 0 = video, 1 = photo
@@ -121,7 +121,8 @@ enum { SF_LOCK = 1, SF_RECONF = 2, SF_IMAGE = 4, SF_MIC_RATE = 8, SF_MIC_GAIN = 
        SF_DUAL = 128,       // may switch the dual-camera setup
        SF_LUT = 256,        // software colour tables need rebuilding
        SF_EQ = 512,         // mic EQ changed
-       SF_DB = 1024 };      // show the number as "+N dB"
+       SF_DB = 1024,        // show the number as "+N dB"
+       SF_PAUSE = 2048 };   // locked while recording, but may change while paused
 enum { G_CAMERA, G_RECORD, G_PHOTO, G_MICEQ };
 
 typedef struct {
@@ -283,6 +284,10 @@ static const Tr tr_tab[] = {
     {" inner only", " tylko wewn."},
     {"A video  Y shoot  L/R x10", "A wideo  Y foto  L/R x10"},
     {"A photo  Y record  L/R x10", "A foto  Y nagrywaj  L/R x10"},
+    {"Y stop  X pause/resume  L/R x10", "Y stop  X pauza/wznow  L/R x10"},
+    {"\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  X = resume, Y = stop\x1b[K\n", "\x1b[33m[PAUZA]\x1b[0m %02lu:%02lu  X = wznow, Y = stop\x1b[K\n"},
+    {"\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  camera starting...\x1b[K\n", "\x1b[33m[PAUZA]\x1b[0m %02lu:%02lu  start kamery...\x1b[K\n"},
+    {"\x1b[33m[PAUSING...]\x1b[0m %02lu:%02lu\x1b[K\n", "\x1b[33m[PAUZOWANIE...]\x1b[0m %02lu:%02lu\x1b[K\n"},
     {"File%2d [%s%s\x1b[0m]%3lu%%", "Plik%2d [%s%s\x1b[0m]%3lu%%"},
     {"No camera frame yet", "Brak klatki z kamery"},
     {"Out of memory", "Brak pamieci"},
@@ -303,9 +308,9 @@ static const char* tr(const char* s) {
 static const Setting settings[] = {
     {"Mode",       "mode",       &s_mode,      0, 1,   NULL,     SF_HIDDEN, G_CAMERA, ""},
     {"Resolution", "res",        &s_res,       0, NUM_RES - 1, L_RES, SF_LOCK | SF_RECONF | SF_VIDEO, G_CAMERA, "Any 3DS camera size; bigger = slower"},
-    {"Camera",     "camera",     &s_cam,       0, 2,   L_CAM,    SF_LOCK | SF_RECONF | SF_VIDEO | SF_DUAL, G_CAMERA, "3D = both outer cams, 3D preview"},
-    {"Outer side", "outer_side", &s_outer,     0, 1,   L_SIDE,   SF_LOCK | SF_RECONF, G_CAMERA, "Which outer camera (when not 3D)"},
-    {"Cam FPS",    "cam_fps",    &s_camfps,    0, 5,   L_CAMFPS, SF_LOCK | SF_RECONF, G_CAMERA, "auto = slower in the dark, less noise"},
+    {"Camera",     "camera",     &s_cam,       0, 2,   L_CAM,    SF_LOCK | SF_PAUSE | SF_RECONF | SF_VIDEO | SF_DUAL, G_CAMERA, "3D = both outer cams, 3D preview"},
+    {"Outer side", "outer_side", &s_outer,     0, 1,   L_SIDE,   SF_LOCK | SF_PAUSE | SF_RECONF, G_CAMERA, "Which outer camera (when not 3D)"},
+    {"Cam FPS",    "cam_fps",    &s_camfps,    0, 5,   L_CAMFPS, SF_LOCK | SF_PAUSE | SF_RECONF, G_CAMERA, "auto = slower in the dark, less noise"},
     {"Scene",      "scene",      &s_scene,     0, 4,   L_SCENE,  SF_IMAGE, G_CAMERA, "Preset; overrides expo/sharp/contrast"},
     {"Effect",     "effect",     &s_effect,    0, 5,   L_EFFECT, SF_IMAGE, G_CAMERA, "Color effect applied by the camera"},
     {"Auto expo.", "auto_exposure",&s_autoexp, 0, 1,   L_ONOFF,  SF_IMAGE, G_CAMERA, "Off = exposure stays where it is"},
@@ -1211,6 +1216,13 @@ static LightEvent rec_event;
 
 static volatile bool rec_active = false;      // encoder should hand frames to the writer
 static volatile bool rec_stop_req = false;
+// Pause: a 4-state handshake between the main thread (asks) and the SD writer (confirms).
+// Only one change is in flight at a time, so the threads can never disagree.
+enum { RS_RUN = 0, RS_PAUSE_REQ, RS_PAUSED, RS_RESUME_REQ };
+static volatile int rec_pstate = RS_RUN;
+static volatile u64 rec_pause_from = 0;       // tick of the pause press (end of what's kept)
+static volatile u64 rec_resume_at = 0;        // tick of the resume press
+static bool rec_running(void) { return rec_active && rec_pstate == RS_RUN; }
 static volatile bool rec_saving = false;      // writer thread still running
 static volatile bool rec_error = false;
 static volatile u32 stat_rec_drop = 0;
@@ -1377,31 +1389,13 @@ static void write_silence(AviWriter* avi, u64 samples) {
 // service paused (samples never arrived), the gap is filled with silence; if we somehow
 // have too much, the oldest excess is skipped. Without this, a 0.2 s mic hiccup shifted
 // all later audio 0.2 s early and the audio track ended before the video.
-static void drain_audio(AviWriter* avi, u32* rp, u64 part_start) {
-    if (!rec_audio_hz) return;
+// Copy mic samples [*rp, hw) into the file (through the EQ), advancing *rp.
+static void mic_copy(AviWriter* avi, u32* rp, u32 hw) {
     if (writer_eq_ver != miceq_version) {             // settings changed (also works mid-recording)
         MicEqParams p;
         writer_eq_ver = miceq_version;
         miceq_params(&p);
         miceq_design(&writer_eq, (float)rec_audio_hz, &p);
-    }
-    u32 hw = mic_hw_pos();
-    u64 now = svcGetSystemTick();
-    {
-        u64 have = avi_audio_samples(avi) + mic_available(*rp) / 2;
-        u64 want = now > part_start ? (now - part_start) * rec_audio_hz / SYSCLOCK_ARM11 : 0;
-        s64 diff = (s64)want - (s64)have;
-        s64 tol = rec_audio_hz / 25;                 // 40 ms: ignore normal jitter
-        if (diff > tol) {                            // mic dropped out: fill the hole
-            write_silence(avi, (u64)diff);
-            stat_audio_fix++;
-        } else if (diff < -tol) {                    // more audio than time passed: skip the excess
-            u32 skip = (u32)(-diff) * 2;
-            u32 avail = mic_available(*rp);
-            if (skip > avail) skip = avail;
-            *rp = (*rp + skip) % mic_size;
-            stat_audio_fix++;
-        }
     }
     while (*rp != hw) {
         u32 end = hw > *rp ? hw : mic_size;
@@ -1421,6 +1415,67 @@ static void drain_audio(AviWriter* avi, u32* rp, u64 part_start) {
         rec_bytes += len;
         *rp = end >= mic_size ? 0 : end;
     }
+}
+
+static void drain_audio(AviWriter* avi, u32* rp, u64 part_start) {
+    if (!rec_audio_hz) return;
+    u32 hw = mic_hw_pos();
+    u64 now = svcGetSystemTick();
+    {
+        u64 have = avi_audio_samples(avi) + mic_available(*rp) / 2;
+        u64 want = now > part_start ? (now - part_start) * rec_audio_hz / SYSCLOCK_ARM11 : 0;
+        s64 diff = (s64)want - (s64)have;
+        s64 tol = rec_audio_hz / 25;                 // 40 ms: ignore normal jitter
+        if (diff > tol) {                            // mic dropped out: fill the hole
+            write_silence(avi, (u64)diff);
+            stat_audio_fix++;
+        } else if (diff < -tol) {                    // more audio than time passed: skip the excess
+            u32 skip = (u32)(-diff) * 2;
+            u32 avail = mic_available(*rp);
+            if (skip > avail) skip = avail;
+            *rp = (*rp + skip) % mic_size;
+            stat_audio_fix++;
+        }
+    }
+    mic_copy(avi, rp, hw);
+}
+
+// Pause: keep exactly the audio recorded up to `until`, so the file's audio ends at the
+// pause moment like its video; everything recorded after it is thrown away.
+static void drain_audio_to(AviWriter* avi, u32* rp, u64 part_start, u64 until) {
+    if (!rec_audio_hz) return;
+    u64 now = svcGetSystemTick();
+    u32 hw = mic_hw_pos();
+    u32 avail = mic_available(*rp) / 2;
+    u64 after = now > until ? (now - until) * rec_audio_hz / SYSCLOCK_ARM11 : 0;   // recorded after the press
+    u32 keep = avail > after ? (u32)(avail - after) : 0;
+    u64 want = until > part_start ? (until - part_start) * rec_audio_hz / SYSCLOCK_ARM11 : 0;
+    u64 have = avi_audio_samples(avi);
+    if (have + keep > want) keep = want > have ? (u32)(want - have) : 0;           // never past the pause
+    mic_copy(avi, rp, (*rp + keep * 2) % mic_size);
+    have = avi_audio_samples(avi);
+    if (want > have) write_silence(avi, want - have);                             // mic gap before the pause
+    *rp = hw;                                                                      // discard the rest
+}
+
+// Cut the recording for a pause: video and audio end at the same video-frame boundary
+// (the first one at/after the press, or after the last frame already written), so they're
+// exactly equal at every pause and nothing can build up over many pauses. Returns the
+// tick the file's timeline stopped at.
+static void pad_video_to(AviWriter* avi, u64 part_start, u64 until, u32 fps);
+static u64 cut_for_pause(AviWriter* avi, u32* rp, u64 part_start, u64 pressed, u32 fps) {
+    pad_video_to(avi, part_start, pressed, fps);
+    u64 nv = avi_video_frames(avi);
+    u64 cut = part_start + (nv * SYSCLOCK_ARM11 + fps / 2) / fps;
+    drain_audio_to(avi, rp, part_start, cut);
+    return cut;
+}
+
+// Repeat-frame the video up to the timeline position of `until`.
+static void pad_video_to(AviWriter* avi, u64 part_start, u64 until, u32 fps) {
+    if (until <= part_start) return;
+    u64 n = ((until - part_start) * fps * 2 + SYSCLOCK_ARM11) / (2 * (u64)SYSCLOCK_ARM11);
+    for (u32 w = avi_video_frames(avi); w < n; w++) avi_write_video(avi, NULL, 0);
 }
 
 // Repeat the last frame until the video is as long as the audio (A/V end together).
@@ -1452,6 +1507,9 @@ static void writer_thread(void* arg) {
     LightLock_Unlock(&slot_lock);
     u32 next_ticket = 0;
     u64 wait_since = 0, stop_since = 0;
+    bool pausing = false, paused = false;          // writer's own view of the pause handshake
+    u64 pause_since = 0, pause_from = 0, pause_cut = 0;
+    u64 drop_before = 0;                           // after a resume: frames captured before it
 
     AviWriter* avi = open_part(part, w, h);
     if (!avi) { rec_error = true; rec_active = false; rec_saving = false; return; }
@@ -1460,7 +1518,29 @@ static void writer_thread(void* arg) {
         LightEvent_WaitTimeout(&rec_event, 20000000LL);
         bool stopping = rec_stop_req;
 
-        if (rec_audio_hz && (stopping || mic_available(mic_rp) >= audio_batch))
+        // ---- pause / resume handshake
+        if (!pausing && !paused && rec_pstate == RS_PAUSE_REQ) {
+            pausing = true; pause_since = osGetTime(); pause_from = rec_pause_from;
+        }
+        if (paused && rec_pstate == RS_RESUME_REQ) {
+            // Continue the timeline where it stopped: shift the clock by the paused time and
+            // read the mic from the resume moment on (nothing in between gets into the file).
+            u64 now = svcGetSystemTick(), resume = rec_resume_at;
+            part_start += resume - pause_cut;       // timeline continues exactly at the cut
+            drop_before = resume;
+            if (rec_audio_hz) {
+                u32 hw = mic_hw_pos();
+                u64 back = now > resume ? (now - resume) * rec_audio_hz / SYSCLOCK_ARM11 * 2 : 0;
+                if (back >= mic_size) back = 0;
+                mic_rp = (u32)((hw + mic_size - (u32)back) % mic_size) & ~1u;
+            }
+            paused = false;
+            __dmb();
+            rec_pstate = RS_RUN;                    // encoders start claiming frames again
+        }
+        if (paused && rec_audio_hz) mic_rp = mic_hw_pos();   // keep the mic buffer from ever overflowing
+
+        if (rec_audio_hz && !paused && !pausing && (stopping || mic_available(mic_rp) >= audio_batch))
             drain_audio(avi, &mic_rp, part_start);
 
         for (;;) {
@@ -1483,6 +1563,10 @@ static void writer_thread(void* arg) {
             next_ticket++;
             wait_since = 0;
             RecFrame* f = &rec_q[idx];
+            // paused: nothing goes in; pausing: only frames captured before the press
+            // after a resume: never a frame captured during the pause (the newest camera frame
+            // at the moment of resuming is usually one of those)
+            if (paused || (pausing && f->tick >= pause_from) || f->tick < drop_before) { rec_release(idx); continue; }
             if (f->tick >= part_start) {
                 // Constant-frame-rate timeline from capture timestamps: if the encoder
                 // skipped frames, insert empty "repeat" chunks so video stays in sync
@@ -1497,6 +1581,21 @@ static void writer_thread(void* arg) {
                 }
             }
             rec_release(idx);
+            // Interleave audio between video frames. When the SD card is the bottleneck
+            // (VGA + high quality) there is always another frame waiting, so without this
+            // the loop never got back to the audio and the mic buffer was overwritten.
+            if (rec_audio_hz && !pausing && !paused && rec_pstate == RS_RUN && mic_available(mic_rp) >= audio_batch)
+                drain_audio(avi, &mic_rp, part_start);
+        }
+
+        // Pause takes effect once every frame captured before the press is in (or 2 s passed):
+        // audio and video are both cut exactly at the press, then the writer confirms.
+        if (pausing && (next_ticket >= rec_tickets_issued() || osGetTime() - pause_since > 2000)) {
+            pause_cut = cut_for_pause(avi, &mic_rp, part_start, pause_from, fps);
+            pausing = false;
+            paused = true;
+            __dmb();
+            rec_pstate = RS_PAUSED;
         }
 
         rec_part = part;
@@ -1504,7 +1603,7 @@ static void writer_thread(void* arg) {
         rec_part_mb = (u32)(avi_file_bytes(avi) >> 20);
         if (avi_failed(avi)) { rec_error = true; break; }   // SD full / removed
 
-        if (avi_should_split(avi)) {
+        if (!paused && !pausing && avi_should_split(avi)) {
             drain_audio(avi, &mic_rp, part_start);
             pad_video_to_audio(avi, fps);
             part_start = svcGetSystemTick();
@@ -1521,7 +1620,11 @@ static void writer_thread(void* arg) {
     }
 
     if (avi) {
-        drain_audio(avi, &mic_rp, part_start);
+        if (pausing) {                      // stopped while a pause was being applied
+            cut_for_pause(avi, &mic_rp, part_start, pause_from, fps);
+        } else if (!paused) {
+            drain_audio(avi, &mic_rp, part_start);
+        }                                   // (stopped while paused: the file already ends at the pause)
         pad_video_to_audio(avi, fps);       // video and audio always end together
         avi_close(avi);
     }
@@ -1550,6 +1653,8 @@ static void start_recording(void) {
     stat_audio_fix = 0;
     rec_error = false;
     rec_stop_req = false;
+    rec_pstate = RS_RUN;
+    rec_resume_at = 0;
     LightLock_Lock(&slot_lock);
     rec_gen++;
     rec_ticket_next = 0;
@@ -1569,6 +1674,32 @@ static void start_recording(void) {
     rec_active = true;
     writer_th = threadCreate(writer_thread, NULL, 0x8000, 0x31, -2, false);
     if (!writer_th) { rec_active = false; rec_saving = false; rec_error = true; }
+}
+
+// Camera being (re)started: settings changed and no frame from the new setup yet.
+static bool cam_starting(void) { return cam_reconfig || slot_latest < 0; }
+
+// X while recording. Ignored while the writer is still confirming the previous change.
+static void toggle_pause(void) {
+    if (!rec_active || rec_stop_req) return;
+    if (rec_pstate == RS_RUN) {
+        rec_pause_from = svcGetSystemTick();
+        __dmb();
+        rec_pstate = RS_PAUSE_REQ;                 // encoders stop claiming frames now
+        LightEvent_Signal(&rec_event);
+    } else if (rec_pstate == RS_PAUSED) {
+        // After a camera switch, wait until the new camera delivers: resuming earlier would
+        // freeze the picture for the ~0.5 s the camera needs to start.
+        if (cam_starting()) return;
+        u64 now = svcGetSystemTick();
+        LightLock_Lock(&slot_lock);                // (64-bit values: written under the lock
+        rec_start_tick += now - rec_pause_from;    //  the encoders read them under)
+        rec_resume_at = now;                       // elapsed time / frame timeline skip the pause
+        LightLock_Unlock(&slot_lock);
+        __dmb();
+        rec_pstate = RS_RESUME_REQ;
+        LightEvent_Signal(&rec_event);
+    }
 }
 
 static void stop_recording(void) {
@@ -1618,6 +1749,7 @@ static bool claim_frame(Claim* c, bool do_rec) {
     c->rec = false;
     if (do_rec) {
         u64 start = rec_start_tick, tick = slots[idx].tick;
+        if (tick < rec_resume_at) { LightLock_Unlock(&slot_lock); return false; }   // captured during a pause
         if (start != claim_rec_start) { claim_rec_start = start; claim_last_n = ~0ull; }
         u64 n = tick > start ? ((tick - start) * rec_fps * 2 + SYSCLOCK_ARM11) / (2 * (u64)SYSCLOCK_ARM11) : 0;
         if (n != claim_last_n) {           // skip frames that would land in a filled timeline slot
@@ -1702,7 +1834,7 @@ static void encoder_thread(void* arg) {
         LightEvent_WaitTimeout(&enc_event, 100000000LL);   // one wake-up per new camera frame
         if (!running) break;
 
-        if (!rec_active) continue;                         // nobody needs JPEGs: stay idle
+        if (!rec_running()) continue;                      // not recording / paused: stay idle
 
         Claim c;
         if (!claim_frame(&c, true)) continue;
@@ -1923,8 +2055,17 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
         printf("\x1b[36mSlopCam\x1b[0m cam %2lu view %2lu enc %2lu fps x%d\x1b[K\n", fps_cap, fps_prev, fps_enc, num_encoders);
 
     if (rec_active) {
-        u32 secs = (u32)((svcGetSystemTick() - rec_start_tick) / SYSCLOCK_ARM11);
+        const int ps = rec_pstate;
+        u64 t_end = (ps == RS_PAUSE_REQ || ps == RS_PAUSED) ? rec_pause_from : svcGetSystemTick();
+        u32 secs = t_end > rec_start_tick ? (u32)((t_end - rec_start_tick) / SYSCLOCK_ARM11) : 0;
         u32 mbmin = secs ? (u32)(rec_bytes * 60 / secs / (1024 * 1024)) : 0;
+        if (ps == RS_PAUSED && cam_starting())
+            printf(tr("\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  camera starting...\x1b[K\n"), secs / 60, secs % 60);
+        else if (ps == RS_PAUSED)
+            printf(tr("\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  X = resume, Y = stop\x1b[K\n"), secs / 60, secs % 60);
+        else if (ps == RS_PAUSE_REQ)
+            printf(tr("\x1b[33m[PAUSING...]\x1b[0m %02lu:%02lu\x1b[K\n"), secs / 60, secs % 60);
+        else
         printf("\x1b[31m[REC]\x1b[0m %02lu:%02lu %5lu fr %4lu late %3lu MB/m\x1b[K\n",
                secs / 60, secs % 60, stat_rec_frames, stat_rec_drop, mbmin);
         // File fill bar: each file stops at ~1.9 GB (AVI 1.0 limit, safely under FAT32's 4 GB)
@@ -1937,7 +2078,7 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
         if (rec_sd_free0) {
             u64 used = rec_bytes;
             u64 left = rec_sd_free0 > used ? rec_sd_free0 - used : 0;
-            u32 bps = secs ? (u32)(used / secs) : 0;
+            u32 bps = secs ? (u32)(used / secs) : 0;   // (paused time isn't counted)
             u32 tl = bps ? (u32)(left / bps) : 0;           // seconds left on the card
             bool low = left < (u64)200 << 20 || (bps && tl < 300);
             printf(" %sSD%3lu.%luG", low ? "\x1b[31m" : "", (u32)(left >> 30), (u32)((left >> 20) % 1024 * 10 / 1024));
@@ -1993,7 +2134,7 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
         const Setting* st = &settings[it];
         format_value(st, val, sizeof(val));
         bool sel = it == menu_cursor;
-        bool lk = locked && (st->flags & SF_LOCK);
+        bool lk = locked && (st->flags & SF_LOCK) && !(rec_pstate == RS_PAUSED && (st->flags & SF_PAUSE));
         char mark = sel ? '>' : (r == 0 && top > 0) ? '^' : (r == MENU_ROWS - 1 && l < nlines - 1) ? 'v' : ' ';
         printf("%s%c %-11s %-17s%s\x1b[0m\x1b[K\n",
                sel ? "\x1b[47;30m" : (lk ? "\x1b[2m" : ""), mark, tr(st->name), val, lk ? (s_lang ? "blok.  " : "locked ") : "       ");
@@ -2001,7 +2142,8 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
 
     if (settings[menu_cursor].group == G_MICEQ) draw_meter();   // live level instead of help text
     else printf("\x1b[36m%.39s\x1b[0m\x1b[K\n", tr(settings[menu_cursor].help));
-    printf("%s", tr(s_mode ? "A video  Y shoot  L/R x10" : "A photo  Y record  L/R x10"));
+    printf("%s", tr(s_mode ? "A video  Y shoot  L/R x10"
+                           : rec_active ? "Y stop  X pause/resume  L/R x10" : "A photo  Y record  L/R x10"));
 }
 
 // ---------------------------------------------------------------- main
@@ -2125,6 +2267,7 @@ int main(void) {
             }
             ui_dirty = true;
         }
+        if ((kDown & KEY_X) && s_mode == 0 && rec_active) { toggle_pause(); ui_dirty = true; }
         if (photo_due_ms && osGetTime() >= photo_due_ms) { photo_due_ms = 0; take_photo(); ui_dirty = true; }
         {   // 3D on exactly while both cameras are actually delivering
             bool want3d = want_dual() && dual_ok && dual_level < 2;
@@ -2149,7 +2292,8 @@ int main(void) {
             const Setting* st = &settings[menu_cursor];
             int dir = (kRep & (KEY_RIGHT | KEY_R)) ? 1 : -1;
             if (kRep & (KEY_L | KEY_R)) dir *= 10;               // L/R = big steps
-            if (!(locked && (st->flags & SF_LOCK))) {
+            bool pause_ok = rec_active && rec_pstate == RS_PAUSED && (st->flags & SF_PAUSE);
+            if (!(locked && (st->flags & SF_LOCK)) || pause_ok) {
                 int v = *st->v + dir;
                 if (st->labels) {                                // lists wrap around
                     int span = st->max - st->min + 1;
@@ -2188,10 +2332,10 @@ int main(void) {
             // for the encoder (matters on Old 3DS).
             static bool skip_toggle = false;
             skip_toggle = !skip_toggle;
-            bool skip = rec_active && ((s_rec_prev == 1 && skip_toggle) || s_rec_prev == 2);
+            bool skip = rec_running() && ((s_rec_prev == 1 && skip_toggle) || s_rec_prev == 2);
             // Preview off: blank the top screen once (a frozen picture would look like a hang).
             static bool pv_blank = false;
-            if (rec_active && s_rec_prev == 2) {
+            if (rec_running() && s_rec_prev == 2) {
                 if (!pv_blank) { hw_job_cancel(); clear_top_buffers(); pv_blank = true; pv_clear = 2; }
             } else {
                 pv_blank = false;
