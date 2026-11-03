@@ -229,8 +229,13 @@ static inline void fdct_col_vals_T(u32 d0, u32 d1, u32 d2, u32 d3, u32 d4, u32 d
     r0[3] = pkhbt(o6, o7); r1[3] = pkhtb(o7, o6);
 }
 
-// (Y0,Y1) lanes from a YUYV word, level shifted and << 1: (2*Y - 256) per lane
-static inline u32 prep_y(u32 p) { return ssub16((p << 1) & 0x01FE01FEu, 0x01000100u); }
+// (Y0,Y1) lanes from a YUYV word, << 1: (2*Y) per lane. The JPEG level shift (-128, i.e.
+// -256 here) is NOT applied per pixel: a constant added to all 64 inputs only changes the
+// DC coefficient (by exactly 64 * 256; every other output is a difference in which it
+// cancels), so it's taken off the DC once after the transform (DC_SHIFT). Bit-identical
+// output, one instruction less per two pixels.
+static inline u32 prep_y(u32 p) { return (p << 1) & 0x01FE01FEu; }
+#define DC_SHIFT(b) ((b)[0] = ssub16((b)[0], 64u * 256u))   // low lane = DC
 
 // Luma block straight from YUYV rows into the first DCT pass (no staging copy).
 static void __attribute__((noinline)) fdct_y(u32* b, const u32* const* rows, int wx) {
@@ -240,15 +245,16 @@ static void __attribute__((noinline)) fdct_y(u32* b, const u32* const* rows, int
         fdct_col_vals_T(prep_y(r0[k]), prep_y(r1[k]), prep_y(r2[k]), prep_y(r3[k]),
                         prep_y(r4[k]), prep_y(r5[k]), prep_y(r6[k]), prep_y(r7[k]), b, k);
     fdct_cols(b + 0); fdct_cols(b + 1); fdct_cols(b + 2); fdct_cols(b + 3);
+    DC_SHIFT(b);
 }
 
 // U and V lanes for chroma column pair k from two YUYV words (p0 = even sample, p1 = odd):
 // uxtb16 pulls (U, V) out of each word, two pack instructions regroup them as (U0, U1)
-// and (V0, V1), then (2x - 256) per lane like the luma path.
+// and (V0, V1), then 2x per lane like the luma path.
 static inline void prep_uv(u32 p0, u32 p1, u32* u, u32* v) {
     u32 a = uxtb16_r8(p0), b = uxtb16_r8(p1);     // (U0, V0), (U1, V1)
-    *u = ssub16(pkhbt(a, b) << 1, 0x01000100u);   // (U0, U1)
-    *v = ssub16(pkhtb(b, a) << 1, 0x01000100u);   // (V0, V1)
+    *u = pkhbt(a, b) << 1;                        // (U0, U1), level shift: DC_SHIFT
+    *v = pkhtb(b, a) << 1;                        // (V0, V1)
 }
 
 // Both chroma blocks of an MCU straight from YUYV (rows2 != NULL -> average row pairs, 4:2:0)
@@ -265,6 +271,7 @@ static void __attribute__((noinline)) fdct_uv(u32* bu, u32* bv, const u32* const
     }
     fdct_cols(bu + 0); fdct_cols(bu + 1); fdct_cols(bu + 2); fdct_cols(bu + 3);
     fdct_cols(bv + 0); fdct_cols(bv + 1); fdct_cols(bv + 2); fdct_cols(bv + 3);
+    DC_SHIFT(bu); DC_SHIFT(bv);
 }
 
 // ---------------------------------------------------------------- bit writer
@@ -355,11 +362,19 @@ static void __attribute__((noinline, noclone)) encode_block(BitW* w, const u32* 
     const s16a* c = (const s16a*)blk;
     u32 acc = w->acc;
     int used = w->used;
-#define FLUSH_STATE() do { w->acc = acc; w->used = used; } while (0)
-#define LOAD_STATE()  do { acc = w->acc; used = w->used; } while (0)
+    u8* op = w->p;
+    // full words go out inline when they need no FF stuffing and there's room (never in
+    // capture mode: lim = NULL); anything else takes the out-of-line path
+    u8* const lim = w->raw ? NULL : w->end - 8;
+#define FLUSH_STATE() do { w->acc = acc; w->used = used; w->p = op; } while (0)
+#define LOAD_STATE()  do { acc = w->acc; used = w->used; op = w->p; } while (0)
 #define PUT(bits, n) do { u32 b_ = (bits); int n_ = (n); int u_ = used + n_; \
         if (__builtin_expect(u_ < 32, 1)) { acc = (acc << n_) | b_; used = u_; } \
-        else { FLUSH_STATE(); put_bits_slow(w, b_, n_); LOAD_STATE(); } } while (0)
+        else { const int rest_ = u_ - 32; \
+            u32 wd_ = (acc << (32 - used)) | (b_ >> rest_); u32 nw_ = ~wd_; \
+            if (__builtin_expect(op <= lim && !((nw_ - 0x01010101u) & ~nw_ & 0x80808080u), 1)) { \
+                wd_ = __builtin_bswap32(wd_); memcpy(op, &wd_, 4); op += 4; acc = b_; used = rest_; \
+            } else { FLUSH_STATE(); put_bits_slow(w, b_, n_); LOAD_STATE(); } } } while (0)
 
     s32 dc = (c[0] * (s32)recip[0] + 0x8000) >> 16;
     s32 diff = dc - *dc_prev; *dc_prev = dc;
@@ -375,6 +390,7 @@ static void __attribute__((noinline, noclone)) encode_block(BitW* w, const u32* 
 #define HOT(k) ((k) < 16 ? NONZERO(k, cv) : __builtin_expect(NONZERO(k, cv), 0))
 #define AC(k) { s32 cv = c[zz_mem[k]]; if (HOT(k)) { \
         s32 v = (cv * (s32)recip[k] + 0x8000) >> 16; int run = k - last - 1; last = k; \
+        __asm__("" : "+r"(last));   /* opaque: stops gcc from cloning the rest of the scan per value of last */ \
         if (__builtin_expect(run <= 15 && (u32)(v + RV_MAX) <= 2 * RV_MAX, 1)) { \
             u32 e = rv[(run << 6) + v + 32]; PUT(e >> 5, e & 31); \
         } else { FLUSH_STATE(); emit_run(w, ac, run, v); LOAD_STATE(); } } }

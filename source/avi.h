@@ -21,6 +21,7 @@ bool avi_should_split(const AviWriter* a);
 u32  avi_fill_permille(const AviWriter* a);   // progress to the next file split, 0..1000
 u64  avi_file_bytes(const AviWriter* a);
 bool avi_failed(const AviWriter* a);
+u32  avi_write_kbs(const AviWriter* a);      // SD write speed so far (KB/s), 0 = unknown
 void avi_close(AviWriter* a);
 
 #endif

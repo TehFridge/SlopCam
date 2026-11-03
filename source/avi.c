@@ -5,7 +5,12 @@
 
 #define AVI_SPLIT_BYTES   (1900ull * 1024 * 1024)  // stay under 2 GB
 #define AVI_MAX_INDEX     (400 * 1024)             // 6.4 MB of index max
-#define AVI_IO_BUFFER     (256 * 1024)
+// Every file-service call on the 3DS SD card has a large fixed cost (tens of ms, measured on
+// a console: a 32 KB read took ~40-90 ms, a 1 MB read ~200-370 ms). The writer used stdio
+// with a 256 KB buffer, so a quarter of every write was overhead: at VGA in a bright scene
+// (big frames) the card couldn't keep up, the record queue filled and frames were dropped
+// ("late"). Now data goes out in 1 MB writes straight to the file service.
+#define AVI_IO_BUFFER     (1024 * 1024)
 
 #define AVIF_HASINDEX       0x10
 #define AVIF_ISINTERLEAVED  0x100
@@ -15,7 +20,13 @@ typedef struct { u32 id, flags, offset, size; } AviIdx;
 
 struct AviWriter {
     FILE* f;
+#ifdef __3DS__
+    Handle fh;          // direct file-service handle (0 = stdio)
+#endif
     char* iobuf;
+    u32 buf_n;          // bytes waiting in iobuf (direct mode)
+    u64 flushed;        // file offset of iobuf[0]
+    u64 wr_bytes, wr_ms;   // write statistics (direct mode)
     u16 w, h;
     u32 fps, arate;
     u64 pos;            // bytes written so far
@@ -98,8 +109,45 @@ static u32 build_header(const AviWriter* a, u8* out, u32 riff_size, u32 movi_siz
     return b.n;
 }
 
+#ifdef __3DS__
+static bool fs_write_at(AviWriter* a, u64 off, const void* data, u32 len) {
+    u32 done = 0;
+    u64 t = osGetTime();
+    bool ok = R_SUCCEEDED(FSFILE_Write(a->fh, &done, off, data, len, 0)) && done == len;
+    a->wr_ms += osGetTime() - t;
+    a->wr_bytes += len;
+    return ok;
+}
+#endif
+
+static void flush_buf(AviWriter* a) {
+#ifdef __3DS__
+    if (a->fh && a->buf_n) {
+        if (!fs_write_at(a, a->flushed, a->iobuf, a->buf_n)) a->error = true;
+        a->flushed += a->buf_n;
+        a->buf_n = 0;
+    }
+#else
+    (void)a;
+#endif
+}
+
 static void put(AviWriter* a, const void* data, u32 len) {
     if (a->error || len == 0) return;
+#ifdef __3DS__
+    if (a->fh) {
+        const u8* d = (const u8*)data;
+        a->pos += len;
+        while (len) {
+            u32 n = AVI_IO_BUFFER - a->buf_n;
+            if (n > len) n = len;
+            memcpy(a->iobuf + a->buf_n, d, n);
+            a->buf_n += n; d += n; len -= n;
+            if (a->buf_n == AVI_IO_BUFFER) { flush_buf(a); if (a->error) return; }
+        }
+        return;
+    }
+#endif
     if (fwrite(data, 1, len, a->f) != len) a->error = true;
     a->pos += len;
 }
@@ -132,10 +180,24 @@ static bool write_chunk(AviWriter* a, const char* fcc, u32 id, u32 flags, const 
 AviWriter* avi_open(const char* path, u16 width, u16 height, u32 fps, u32 audio_rate) {
     AviWriter* a = calloc(1, sizeof(AviWriter));
     if (!a) return NULL;
-    a->f = fopen(path, "wb");
-    if (!a->f) { free(a); return NULL; }
     a->iobuf = malloc(AVI_IO_BUFFER);
-    if (a->iobuf) setvbuf(a->f, a->iobuf, _IOFBF, AVI_IO_BUFFER);
+#ifdef __3DS__
+    if (a->iobuf) {     // "sdmc:/dir/file" -> "/dir/file" on the SD archive
+        const char* p = strncmp(path, "sdmc:", 5) == 0 ? path + 5 : path;
+        Handle fh = 0;
+        if (R_SUCCEEDED(FSUSER_OpenFileDirectly(&fh, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                                                fsMakePath(PATH_ASCII, p), FS_OPEN_WRITE | FS_OPEN_CREATE, 0))) {
+            if (R_SUCCEEDED(FSFILE_SetSize(fh, 0))) a->fh = fh;    // (an old file of that name: start empty)
+            else FSFILE_Close(fh);
+        }
+    }
+    if (!a->fh)
+#endif
+    {
+        a->f = fopen(path, "wb");
+        if (!a->f) { free(a->iobuf); free(a); return NULL; }
+        if (a->iobuf) setvbuf(a->f, a->iobuf, _IOFBF, AVI_IO_BUFFER);
+    }
 
     a->w = width; a->h = height; a->fps = fps ? fps : 30; a->arate = audio_rate;
 
@@ -183,8 +245,39 @@ bool avi_should_split(const AviWriter* a) {
     return a && (a->pos >= AVI_SPLIT_BYTES || a->idx_count + 64 >= AVI_MAX_INDEX);
 }
 
+// SD write speed of the 1 MB writes so far, in KB/s (0 = not known yet / stdio).
+u32 avi_write_kbs(const AviWriter* a) {
+    if (!a || !a->wr_ms) return 0;
+    return (u32)(a->wr_bytes * 1000 / 1024 / a->wr_ms);
+}
+
 void avi_close(AviWriter* a) {
     if (!a) return;
+#ifdef __3DS__
+    if (a->fh) {
+        u32 movi_size = (u32)(a->pos - (a->movi_fcc_pos - 4) - 4);
+        u8 hdr[8];
+        memcpy(hdr, "idx1", 4);
+        u32 isz = a->idx_count * sizeof(AviIdx);
+        memcpy(hdr + 4, &isz, 4);
+        bool was_error = a->error;
+        a->error = false;               // still try to finalize a partial file
+        put(a, hdr, 8);
+        put(a, a->idx, isz);
+        flush_buf(a);
+        u32 riff_size = (u32)(a->pos - 8);
+        u8 h[HDR_MAX];
+        u32 n = build_header(a, h, riff_size, movi_size);
+        fs_write_at(a, 0, h, n);        // final counts into the header
+        FSFILE_Flush(a->fh);
+        FSFILE_Close(a->fh);
+        a->error = was_error;
+        free(a->idx);
+        free(a->iobuf);
+        free(a);
+        return;
+    }
+#endif
     if (a->f) {
         u32 movi_size = (u32)(a->pos - (a->movi_fcc_pos - 4) - 4);
         u8 hdr[8];

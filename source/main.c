@@ -24,6 +24,7 @@
 #include <turbojpeg.h>
 #include "avi.h"
 #include "fastjpeg.h"
+#include "gallery.h"
 #include "stitch.h"
 #include "audio_eq.h"
 
@@ -282,8 +283,14 @@ static const Tr tr_tab[] = {
     {" L cam only", " tylko kam. L"},
     {" R cam only", " tylko kam. P"},
     {" inner only", " tylko wewn."},
-    {"A video  Y shoot  L/R x10", "A wideo  Y foto  L/R x10"},
-    {"A photo  Y record  L/R x10", "A foto  Y nagrywaj  L/R x10"},
+    {"A video  Y shoot  SEL gallery", "A wideo  Y foto  SEL galeria"},
+    {"A photo  Y record  SEL gallery", "A foto  Y nagrywaj  SEL galeria"},
+    {"GALLERY", "GALERIA"}, {"Reading index...", "Czytanie indeksu..."}, {"files", "plikow"}, {"photo", "zdjecie"},
+    {" no sound", " bez dzwieku"}, {" (cut off)", " (urwane)"},
+    {"Can't open this file", "Nie mozna otworzyc pliku"},
+    {"No photos or videos yet", "Brak zdjec i filmow"},
+    {"A play/pause  B back  </> seek  ^v pick", "A graj/pauza  B wroc  </> 5s  ^v wybor"},
+    {"PAUSED", "PAUZA"}, {"PLAY", "GRA"}, {"STOP", "STOP"}, {" (no DSP firm.)", " (brak DSP firm.)"},
     {"Y stop  X pause/resume  L/R x10", "Y stop  X pauza/wznow  L/R x10"},
     {"\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  X = resume, Y = stop\x1b[K\n", "\x1b[33m[PAUZA]\x1b[0m %02lu:%02lu  X = wznow, Y = stop\x1b[K\n"},
     {"\x1b[33m[PAUSED]\x1b[0m %02lu:%02lu  camera starting...\x1b[K\n", "\x1b[33m[PAUZA]\x1b[0m %02lu:%02lu  start kamery...\x1b[K\n"},
@@ -298,7 +305,7 @@ static const Tr tr_tab[] = {
     {"\x1b[1;0H\x1b[33m[PHOTO] saving...\x1b[0m\x1b[K", "\x1b[1;0H\x1b[33m[FOTO] zapisywanie...\x1b[0m\x1b[K"},
     {"\x1b[2J\x1b[0;0HSaving video...\n", "\x1b[2J\x1b[0;0HZapisywanie wideo...\n"},
 };
-static const char* tr(const char* s) {
+const char* tr(const char* s) {
     if (!s_lang || !s) return s;
     for (unsigned i = 0; i < sizeof(tr_tab) / sizeof(tr_tab[0]); i++)
         if (!strcmp(s, tr_tab[i].en)) return tr_tab[i].pl;
@@ -422,6 +429,7 @@ static LightEvent enc_event;
 
 static volatile bool running = true;
 static volatile bool cam_reconfig = true;
+static volatile bool cam_suspend = false;   // gallery open: camera off, capture thread idle
 static volatile u32 stat_cap = 0, stat_enc = 0, stat_prev = 0;
 static volatile int stat_skip_pct = -1;  // static skip: % of macroblocks reused in the last recorded frame
 
@@ -652,6 +660,16 @@ static void capture_thread(void* arg) {
     #define CLOSE(h) do { if (h) { svcCloseHandle(h); h = 0; } } while (0)
 
     while (running) {
+        if (cam_suspend) {                      // gallery: switch the camera off and wait
+            if (active) {
+                CAMU_StopCapture(PORT_BOTH);
+                for (int p = 0; p < 2; p++) { CLOSE(ev_recv[p]); CLOSE(ev_err[p]); got[p] = false; }
+                CAMU_Activate(SELECT_NONE);
+                active = false;
+            }
+            svcSleepThread(50000000LL);
+            continue;                           // (!active restarts it when the gallery closes)
+        }
         // (Re)start the camera: on startup, on settings change, or if frames stopped
         // arriving (e.g. after sleep mode / HOME menu).
         if (cam_reconfig || !active || osGetTime() - last_frame_ms > 3000) {
@@ -1238,6 +1256,7 @@ static volatile u64 rec_bytes = 0;            // payload written, for the MB/min
 static volatile int rec_part = 0;             // current file number (files split at ~1.9 GB)
 static volatile u32 rec_part_fill = 0;        // current file: 0..1000 of the way to the split
 static volatile u32 rec_part_mb = 0;          // current file size in MB
+static volatile u32 rec_sd_kbs = 0;           // SD write speed of the current file (KB/s), 0 = unknown
 static u64 rec_sd_free0 = 0;                  // SD free bytes when recording started (0 = unknown)
 
 static u8* mic_buf = NULL;
@@ -1601,6 +1620,7 @@ static void writer_thread(void* arg) {
         rec_part = part;
         rec_part_fill = avi_fill_permille(avi);
         rec_part_mb = (u32)(avi_file_bytes(avi) >> 20);
+        { u32 k = avi_write_kbs(avi); if (k) rec_sd_kbs = k; }
         if (avi_failed(avi)) { rec_error = true; break; }   // SD full / removed
 
         if (!paused && !pausing && avi_should_split(avi)) {
@@ -1665,7 +1685,7 @@ static void start_recording(void) {
     rec_fps = val_recfps[s_rec_fps];
     rec_audio_hz = (mic_sampling && s_audio > 0) ? val_audio_hz[s_audio] : 0;
     rec_bytes = 0;
-    rec_part = 0; rec_part_fill = 0; rec_part_mb = 0;
+    rec_part = 0; rec_part_fill = 0; rec_part_mb = 0; rec_sd_kbs = 0;
     FS_ArchiveResource res;
     rec_sd_free0 = R_SUCCEEDED(FSUSER_GetArchiveResource(&res, SYSTEM_MEDIATYPE_SD))
                    ? (u64)res.freeClusters * res.clusterSize : 0;
@@ -2066,8 +2086,17 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
         else if (ps == RS_PAUSE_REQ)
             printf(tr("\x1b[33m[PAUSING...]\x1b[0m %02lu:%02lu\x1b[K\n"), secs / 60, secs % 60);
         else
-        printf("\x1b[31m[REC]\x1b[0m %02lu:%02lu %5lu fr %4lu late %3lu MB/m\x1b[K\n",
-               secs / 60, secs % 60, stat_rec_frames, stat_rec_drop, mbmin);
+        {
+            // data rate the recording needs / what the SD card manages: when the first gets
+            // close to the second, frames start to be dropped ("late")
+            u32 need = secs ? (u32)(rec_bytes * 10 / secs / (1024 * 1024)) : 0;   // tenths of MB/s
+            u32 sd = rec_sd_kbs * 10 / 1024;
+            (void)mbmin;
+            if (sd) printf("\x1b[31m[REC]\x1b[0m %02lu:%02lu %4lufr %3lulate %lu.%lu/%lu.%luMB/s\x1b[K\n",
+                           secs / 60, secs % 60, stat_rec_frames, stat_rec_drop, need / 10, need % 10, sd / 10, sd % 10);
+            else printf("\x1b[31m[REC]\x1b[0m %02lu:%02lu %4lufr %3lulate %lu.%luMB/s\x1b[K\n",
+                        secs / 60, secs % 60, stat_rec_frames, stat_rec_drop, need / 10, need % 10);
+        }
         // File fill bar: each file stops at ~1.9 GB (AVI 1.0 limit, safely under FAT32's 4 GB)
         // and the next part starts by itself. Then SD space and time left at the current rate.
         char bar[13];
@@ -2142,8 +2171,8 @@ static void draw_ui(u32 fps_cap, u32 fps_prev, u32 fps_enc) {
 
     if (settings[menu_cursor].group == G_MICEQ) draw_meter();   // live level instead of help text
     else printf("\x1b[36m%.39s\x1b[0m\x1b[K\n", tr(settings[menu_cursor].help));
-    printf("%s", tr(s_mode ? "A video  Y shoot  L/R x10"
-                           : rec_active ? "Y stop  X pause/resume  L/R x10" : "A photo  Y record  L/R x10"));
+    printf("%s", tr(s_mode ? "A video  Y shoot  SEL gallery"
+                           : rec_active ? "Y stop  X pause/resume  L/R x10" : "A photo  Y record  SEL gallery"));
 }
 
 // ---------------------------------------------------------------- main
@@ -2268,6 +2297,19 @@ int main(void) {
             ui_dirty = true;
         }
         if ((kDown & KEY_X) && s_mode == 0 && rec_active) { toggle_pause(); ui_dirty = true; }
+        if ((kDown & KEY_SELECT) && !rec_active && !rec_saving && !photo_due_ms) {
+            hw_job_cancel();                       // (holds a camera slot + Y2R)
+            cam_suspend = true;
+            bool keep = gallery_run(SAVE_FOLDER);
+            cam_suspend = false;
+            cam_reconfig = true;
+            pv_clear = 2;
+            clear_top_buffers();
+            consoleClear();
+            ui_dirty = true;
+            if (!keep) break;
+            continue;
+        }
         if (photo_due_ms && osGetTime() >= photo_due_ms) { photo_due_ms = 0; take_photo(); ui_dirty = true; }
         {   // 3D on exactly while both cameras are actually delivering
             bool want3d = want_dual() && dual_ok && dual_level < 2;
